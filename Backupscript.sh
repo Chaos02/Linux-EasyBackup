@@ -10,7 +10,8 @@
 #Source=sda
 #Target=sdb
 execname=${0##*/}
-LogPath=‎"/var/log/${execname%%.*}"
+LogPath="/var/log/${execname%%.*}"
+s_time=$(date '+%Y-%m-%dT%H:%M:%S') # 2004-06-14T23:34:30
 
 if ! [ $(id -u) = 0 ]; then #every shell
    echo "Program needs to be run as root!"
@@ -41,6 +42,12 @@ rm ${LogPath}/BackupStatus &> /dev/null
 touch ${LogPath}/BackupStatus
 chmod -R --preserve-root 4666 "${LogPath}" #-c
 
+function trapper () {
+	#resets the trapper to default
+	trap ${1:-'exit=1; exitroutine; exit 1'} ${2:-SIGINT}
+}
+
+
 function pause () {
 	#waits for user input with optional delay
 	if [[ "$2" != '' ]]; then
@@ -52,8 +59,8 @@ function pause () {
 
 
 function exitroutine () {
-	touch ${LogPath}/Backup.log
-	cat ${LogPath}/BackupStatus | tee -a "${LogPath}/Backup.log" > /dev/null
+	touch ${LogPath}/Backup_${s_time}.log
+	cat ${LogPath}/BackupStatus | tee -a "${LogPath}/Backup_${s_time}.log" 1> /dev/null
 
 	if [[ "$write" != true ]]; then
 		exit=1
@@ -61,6 +68,8 @@ function exitroutine () {
 	if [[ "$exit" == "0" ]]; then
 		touch ${LogPath}/BackupDone
 	fi
+	e_time=$(date '+%Y-%m-%dT%H:%M:%S')
+	echo "$execname finished with exit code $exit at $e_time" | tee -a "${LogPath}/Backup_${s_time}.log"
 	exit $exit #returns error/sucess code
 }
 
@@ -145,12 +154,15 @@ function confirm () {
 	# call with a prompt string or use a default
 	response=''
 	while [[ $response != @(true|false) ]]; do
-		read -r -p "${1:-Are you sure?} [y/n]: " response
+		read -r -p "${1:-Are you sure? [y/N]}: " response
 		case ${response,,} in
 			yes|y) 
 				response=true
 				;;
 			no|n)
+				response=false
+				;;
+			\ ) # Default??
 				response=false
 				;;
 			*)
@@ -171,7 +183,7 @@ Clone entire disks reliably, with a test mode
 	f, --force	clone even if disconnected from main power or 
 			  the specified disk identifier is not found
 	h, --help	prints this help
-	i, --install	installs ${execname} to bin or 
+	i, --install	opens dialog to install ${execname} to bin or 
 			  privatebin optionally
 			  and or schedules to run during Read only phase of boot
 			  with anacron
@@ -251,6 +263,9 @@ function ReadArgs () {
 	while [ $i -le ${#@} ]; do
 		arg="${@:$i:1}"
 		case ${arg,,} in #only lowercase
+		--debug)
+			set -xv
+			;;
 		-h|--help)
 			HELP
 			exit 0
@@ -372,8 +387,10 @@ $period	0	${execname}	\"touch /etc/${execname}.pending\"
 				esac
 				tput clear
 			done
-			tcup rmcup
-			exit 0 #status of script
+			trapper
+			tput rmcup
+			exit=0 #status of script
+			exitroutine
 			;;
 		-s|--source=*)
 			if [[ ${arg:0:2} == '--' ]]; then
@@ -473,7 +490,7 @@ function clonefunc () {
 		cloning="dd if=/dev/$part of=/dev/$targetpart bs=$(cat /sys/block/$Source/queue/physical_block_size 2> /dev/null)K conv=noerror,sync,sparse status=progress"
 		if [[ $write == true ]]; then
 			echo $cloning
-			echo "$(expr $(cat /sys/block/$Source/$part/size 2> /dev/null) \* 512) bytes"
+			echo "$(expr $(cat /sys/block/$Source/$part/size 2> /dev/null) \* 512) bytes" # for some reason 511.46875?
 			$cloning
 		else
 			echo "$(expr $(cat /sys/block/$Source/$part/size 2> /dev/null) \* 512) bytes"
@@ -482,19 +499,19 @@ function clonefunc () {
 }
 
 if [[ $write == true ]]; then
-	function sgdisk () {
-		#sgdisk with -P
-		sgdisk "$*"
+# DO NOT QUOTE THE ARGUMENTS!
+	function sgdiskF () {
+		sgdisk ${@}
 	}
 else
-	function sgdisk () {
-		#sgdisk with -P
-		sgdisk -P "$*"
+	function sgdiskF () {
+		#sgdisk with -Pretend parameter
+		sgdisk -P ${@}
 	}
 fi
 
 
-
+trapper
 
 echo "[======Backup script by Chaos_02======]"
 if [[ -t 0 ]]; then
@@ -514,7 +531,7 @@ fi
 #fi
 if [[ ${Exclude[*]} != '' ]]; then
 	( log Excluding ${Exclude[@]}. ) | tee -a "${LogPath}/BackupStatus"
-	sleep 3
+	sleep 1
 fi
 # This script is meant to be run by anacron.
 # Will Schedule to run another time when it fails in the background if "at" is installed
@@ -522,14 +539,14 @@ fi
 on_ac_power
 if [[ $? == 0 ]] || [[ $? == 255 ]] || [[ $force == true ]]; then #main power or unknown
 
-	if [[ "$(ls /dev/${Source} &> /dev/null)" != $Source ]]; then
-		( log Specified target not found "($Source)" ) | tee -a "${LogPath}/BackupStatus"
+	if [[ "$(ls /dev/${Source})" != /dev/${Source} ]]; then
+		( log Specified Source not found "($Source)" ) | tee -a "${LogPath}/BackupStatus"
 		exit=1
 		exitroutine
 		exit
 	fi
 	
-	if [[ "$(ls /dev/${Target} &> /dev/null)" != $Target ]]; then
+	if [[ "$(ls /dev/${Target})" != /dev/${Target} ]]; then
 		( log Specified target not found "($Target)" ) | tee -a "${LogPath}/BackupStatus"
 		exit=1
 		exitroutine
@@ -566,7 +583,7 @@ if [[ $? == 0 ]] || [[ $? == 255 ]] || [[ $force == true ]]; then #main power or
 		
 #=====Check if all parts existing, creating missing=====#
 
-		if [[ $(ls /dev/${Target} &> /dev/null) ]]; then
+		if [[ $(ls /dev/${Target}) ]]; then
 			for part in $( ls --color=never /dev/${Source}? | grep -oE '(((nvme|mmcblk)[0-9]+p[0-9]+)|((sd|x?vd)[A-Za-z]+[0-9]+))' ); do
 				targetpart=${Target}$( echo $part | grep -oE '((p[0-9]+)|([0-9]+))' )
 				if ! printf '%s\n' "${Exclude[@]}" | grep -q -P "^${part}$"; then	#checks if nothing is to be excluded?
@@ -591,12 +608,12 @@ if [[ $? == 0 ]] || [[ $? == 255 ]] || [[ $force == true ]]; then #main power or
 							fi
 							if [[ $response == true ]]; then # DOES NOT WORK?? FAULTY.
 								response=""
-								echo "To automate, supply the -a argument."
+								echo "To automate, supply the -a switch."
 								partnum=$(echo $part | grep -oE '[0-9]+')
 								if [[ $write == true ]]; then
-									sgdisk -d $partnum /dev/$Target
+									sgdiskF -d $partnum /dev/$Target
 								else
-									sgdisk -P -d $partnum /dev/$Target
+									sgdiskF -P -d $partnum /dev/$Target
 								fi
 								createonce=true
 							fi
@@ -606,13 +623,13 @@ if [[ $? == 0 ]] || [[ $? == 255 ]] || [[ $force == true ]]; then #main power or
 					fi
 					if [[ "$create" != true ]] && [[ "$createonce" != true ]]; then
 						confirm "Create? [y/N]"
+						echo "To automate, supply -c switch"
 					else
 						response=true
 					fi
 					if [[ $response == true ]]; then
 						response=""
 						( log Creating $targetpart. ) | tee -a "${LogPath}/BackupStatus"
-						echo "To automate, supply -c switch"
 						start=$(cat /sys/block/$Source/$part/start 2> /dev/null)
 						size=$(cat /sys/block/$Source/$part/size 2> /dev/null)
 						declare -i end
@@ -621,11 +638,13 @@ if [[ $? == 0 ]] || [[ $? == 255 ]] || [[ $force == true ]]; then #main power or
 						partname=$(grep PARTNAME /sys/block/$Source/$part/uevent)
 						partname=${partname#*=}
 						typecode=$(sgdisk -p /dev/$Source | grep -E "^ *${partnum}" | awk '{print $6}')
+						( log "$part type code: >$typecode<" ) | tee -a "${LogPath}/BackupStatus"
 						partdetails=$(parted /dev/$Source print | grep -E "^ *${partnum}" | grep -E "[ \t\n\r][0-9]+(  )+ ?[^ \t\n\r]+(  )+ ?[^ \t\n\r]*(  )+ ?[^ \t\n\r]*(   ?[A-Za-z0-9]+ {0,9}| {15} ?) ?([^ ]+ ?)+")
 						detailsnoflags=$(parted /dev/$Source print | grep -E "^ *${partnum}" | grep -o -E "[ \t\n\r][0-9]+(  )+ ?[^ \t\n\r]+(  )+ ?[^ \t\n\r]*(  )+ ?[^ \t\n\r]*(   ?[A-Za-z0-9]+ {0,9}| {15} ?) ?([^ ]+ ?)+")
 						flags=( ${partdetails#$detailsnoflags} )
-						echo "Part flags are '${flags[@]}'"
-						sgdisk -a 1 -n $partnum:$start:$end -c $partnum:"$partname" -t $partnum:${typecode,,} /dev/$Target #1> /dev/null
+						( log "$part flags: >${flags[@]}<" ) | tee -a "${LogPath}/BackupStatus"
+						# Problem with function and quotes at name?
+						sgdisk -a 1 -n $partnum:$start:$end -c $partnum:"$partname" -t $partnum:"${typecode,,}" /dev/$Target #1> /dev/null
 						
 						#copy part flags
 						counter=${#flags[@]}-1
@@ -677,12 +696,12 @@ if [[ $? == 0 ]] || [[ $? == 255 ]] || [[ $force == true ]]; then #main power or
 		
 		
 		#Checking if part table is out of bounds
-		sgdisk -v /dev/$Target
+		sgdiskF -v /dev/$Target
    					if [[ $? == 0 ]]; then
    						( log No Problems with $Target part table. ) |tee -a "${LogPath}/BackupStatus"
    						exit=0
    					else
-   						sgdisk -v /dev/$Target|tee -a "${LogPath}/BackupStatus"
+   						sgdiskF -v /dev/$Target|tee -a "${LogPath}/BackupStatus"
    						if [[ ! $resolve == true ]]; then
    							echo "Do you want to solve these errors by removing partitions one by one from the end? (useful if target is smaller than source)"
    							confirm "Resolve Errors? [y/N]"
@@ -696,10 +715,10 @@ if [[ $? == 0 ]] || [[ $? == 255 ]] || [[ $force == true ]]; then #main power or
    							declare -i counter
    							counter=${#targetpart[@]}-1
    							for (( i = counter; i >= 0; i-- )); do
-   								sgdisk -v /dev/$Target
+   								sgdiskF -v /dev/$Target
    								if [[ $? != 0 ]]; then
    									( log Removing ${Target}${i} now. ) |tee -a "${LogPath}/BackupStatus"
-   									sgdisk -d $i /dev/$Target
+   									sgdiskF -d $i /dev/$Target
    								else
    									( log No errors anymore! Continuing. ) |tee -a "${LogPath}/BackupStatus"
    									break
